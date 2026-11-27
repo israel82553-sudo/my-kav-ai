@@ -34,8 +34,9 @@ const TTS_LIST = String(process.env.TTS_MODEL || 'gemini-3.8-flash-tts').split('
 const TTS_MODEL = TTS_LIST[0];
 const VOICE = process.env.VOICE || 'Kore';
 const EXT = (process.env.EXT_PATH || '1').replace(/^\/+|\/+$/g, '');
-const TOKEN = process.env.YEMOT_TOKEN ||
-  (process.env.YEMOT_API_USERNAME && process.env.YEMOT_API_PASSWORD ? process.env.YEMOT_API_USERNAME + ':' + process.env.YEMOT_API_PASSWORD : '');
+const TOKEN = String(process.env.YEMOT_TOKEN ||
+  (process.env.YEMOT_API_USERNAME && process.env.YEMOT_API_PASSWORD ? process.env.YEMOT_API_USERNAME + ':' + process.env.YEMOT_API_PASSWORD : '')).trim();
+const YEMOT_USER = String(process.env.YEMOT_API_USERNAME || '0772290673').trim();
 const API_SECRET = String(process.env.API_SECRET || '').trim();
 const MAX_TURNS_PER_HOUR = Math.max(0, parseInt(process.env.MAX_TURNS_PER_HOUR, 10) || 40);
 
@@ -77,6 +78,36 @@ const YM = process.env.YEMOT_BASE || 'https://www.call2all.co.il/ym/api/';
 const GBASE = process.env.GEMINI_BASE || 'https://generativelanguage.googleapis.com/v1beta/models/';
 const BUDGET = Number(process.env.TURN_BUDGET_MS) || 80000;
 const REC_MAX = String(parseInt(process.env.REC_MAX, 10) || 30);
+
+// Yemot session token manager (supports both user:pass and standalone API keys via Login)
+let ymSession = { token: '', exp: 0, promise: null };
+async function getYemotToken(deadline) {
+  if (!TOKEN) return '';
+  if (TOKEN.includes(':')) return TOKEN;
+  const now = Date.now();
+  if (ymSession.token && ymSession.exp > now) return ymSession.token;
+  if (ymSession.promise) return ymSession.promise;
+  ymSession.promise = (async () => {
+    try {
+      const u = YM + 'Login?username=' + encodeURIComponent(YEMOT_USER) + '&password=' + encodeURIComponent(TOKEN);
+      const r = await http(u, {}, 10000, deadline);
+      const j = await r.json().catch(() => ({}));
+      if (j.responseStatus === 'OK' && j.token) {
+        ymSession.token = String(j.token);
+        ymSession.exp = Date.now() + 25 * 60 * 1000;
+        return ymSession.token;
+      }
+      throw new Error(JSON.stringify(j).slice(0, 180));
+    } finally {
+      ymSession.promise = null;
+    }
+  })();
+  return ymSession.promise;
+}
+function invalidateYemotToken() {
+  ymSession.token = '';
+  ymSession.exp = 0;
+}
 
 // Yemot cannot read these characters inside t- text, and , = break the read= syntax
 const sp = s => String(s).replace(/[.\-"'&|,=]/g, ' ').replace(/\s+/g, ' ').trim();
@@ -306,7 +337,7 @@ async function groqSearch(query, site, deadline) {
             { role: 'user', content: site ? 'Look at the website "' + site + '" (open it directly if you can). Request: ' + (query || 'the current main headlines') : query }
           ],
           tools: [{ type: 'browser_search' }],
-          tool_choice: 'required',
+          tool_choice: 'auto',
           reasoning_effort: 'low',
           max_completion_tokens: 900,
           stream: false
@@ -640,7 +671,7 @@ async function groqText(system, user, deadline, ms) {
           model: GROQ_MODEL,
           messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
           tools: [{ type: 'browser_search' }],
-          tool_choice: 'required',
+          tool_choice: 'auto',
           reasoning_effort: 'low',
           max_completion_tokens: 1500,
           stream: false
@@ -969,10 +1000,13 @@ async function download(name, deadline, d) {
   let last = '';
   for (let i = 0; i < 4; i++) {
     try {
-      const r = await http(YM + 'DownloadFile?token=' + encodeURIComponent(TOKEN) + '&path=' + encodeURIComponent(yp(name, d)), {}, 8000, deadline);
+      const tk = await getYemotToken(deadline);
+      const r = await http(YM + 'DownloadFile?token=' + encodeURIComponent(tk) + '&path=' + encodeURIComponent(yp(name, d)), {}, 8000, deadline);
       const b = Buffer.from(await r.arrayBuffer());
       if (r.ok && b.length > 100 && b.subarray(0, 4).toString() === 'RIFF') return b;
-      last = r.status + ' ' + b.subarray(0, 80).toString('utf8').replace(/\s+/g, ' ');
+      const msg = b.subarray(0, 120).toString('utf8').replace(/\s+/g, ' ');
+      if (/session token is invalid/i.test(msg)) invalidateYemotToken();
+      last = r.status + ' ' + msg;
     } catch (e) {
       if (isBudget(e)) throw e;
       last = e.message;
@@ -991,18 +1025,20 @@ async function upload(name, buf, deadline, d, ms) {
   let last = '';
   for (const a of attempts) {
     try {
+      const tk = await getYemotToken(deadline);
       const f = new FormData();
       let url = YM + 'UploadFile';
       if (a.q) {
-        url += '?token=' + encodeURIComponent(TOKEN) + '&path=' + encodeURIComponent(path) + '&convertAudio=1';
+        url += '?token=' + encodeURIComponent(tk) + '&path=' + encodeURIComponent(path) + '&convertAudio=1';
       } else {
-        f.append('token', TOKEN); f.append('path', path); f.append('convertAudio', '1');
+        f.append('token', tk); f.append('path', path); f.append('convertAudio', '1');
       }
       f.append(a.field, new Blob([buf], { type: 'audio/wav' }), name + '.wav');
       const r = await http(url, { method: 'POST', body: f }, ms || 15000, deadline);
       const j = await r.json().catch(() => ({}));
       if (r.ok && j.responseStatus === 'OK') return;
       last = JSON.stringify(j).slice(0, 200);
+      if (/session token is invalid/i.test(last)) invalidateYemotToken();
     } catch (e) {
       if (isBudget(e)) throw e;
       last = e.message;
@@ -1016,22 +1052,25 @@ async function uploadText(name, text, deadline, d) {
   const what = yp(name + '.txt', d);
   let last = '';
   try {
+    const tk = await getYemotToken(deadline);
     const r = await http(YM + 'UploadTextFile', {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ token: TOKEN, what, contents: text })
+      body: new URLSearchParams({ token: tk, what, contents: text })
     }, 15000, deadline);
     const j = await r.json().catch(() => ({}));
     if (r.ok && j.responseStatus === 'OK') return;
     last = JSON.stringify(j).slice(0, 200);
+    if (/session token is invalid/i.test(last)) invalidateYemotToken();
   } catch (e) {
     if (isBudget(e)) throw e;
     last = e.message;
   }
   try {
+    const tk = await getYemotToken(deadline);
     const f = new FormData();
     f.append('file', new Blob([text], { type: 'text/plain' }), name + '.txt');
-    const r = await http(YM + 'UploadFile?token=' + encodeURIComponent(TOKEN) + '&path=' + encodeURIComponent(what) + '&convertAudio=0', { method: 'POST', body: f }, 15000, deadline);
+    const r = await http(YM + 'UploadFile?token=' + encodeURIComponent(tk) + '&path=' + encodeURIComponent(what) + '&convertAudio=0', { method: 'POST', body: f }, 15000, deadline);
     const j = await r.json().catch(() => ({}));
     if (r.ok && j.responseStatus === 'OK') return;
     last += ' | ' + JSON.stringify(j).slice(0, 150);
@@ -1042,14 +1081,21 @@ async function uploadText(name, text, deadline, d) {
   throw new Error('text upload failed ' + last);
 }
 async function downloadText(name, deadline, d) {
-  const r = await http(YM + 'DownloadFile?token=' + encodeURIComponent(TOKEN) + '&path=' + encodeURIComponent(yp(name + '.txt', d)), {}, 8000, deadline);
+  const tk = await getYemotToken(deadline);
+  const r = await http(YM + 'DownloadFile?token=' + encodeURIComponent(tk) + '&path=' + encodeURIComponent(yp(name + '.txt', d)), {}, 8000, deadline);
   const t = await r.text();
-  if (!r.ok || /^\s*\{\s*"responseStatus"/.test(t)) throw new Error('text download failed ' + t.slice(0, 80));
+  if (!r.ok || /^\s*\{\s*"responseStatus"/.test(t)) {
+    if (/session token is invalid/i.test(t)) invalidateYemotToken();
+    throw new Error('text download failed ' + t.slice(0, 80));
+  }
   return t;
 }
 
-function del(name, d) {
-  fetch(YM + 'FileAction?token=' + encodeURIComponent(TOKEN) + '&action=delete&what=' + encodeURIComponent(yp(name, d)), { signal: AbortSignal.timeout(8000) }).catch(() => {});
+async function del(name, d) {
+  try {
+    const tk = await getYemotToken(Date.now() + 8000);
+    await fetch(YM + 'FileAction?token=' + encodeURIComponent(tk) + '&action=delete&what=' + encodeURIComponent(yp(name, d)), { signal: AbortSignal.timeout(8000) });
+  } catch (e) {}
 }
 
 app.get('/', (q, r) => { r.set('Access-Control-Allow-Origin', '*'); r.send('ok'); });
@@ -1104,7 +1150,8 @@ function ensureBeep(d) {
     beepP[d] = (async () => {
       const dl = Date.now() + 25000;
       try {
-        const r = await http(YM + 'GetIVR2Dir?token=' + encodeURIComponent(TOKEN) + '&path=' + encodeURIComponent('ivr2:' + d), {}, 6000, dl);
+        const tk = await getYemotToken(dl);
+        const r = await http(YM + 'GetIVR2Dir?token=' + encodeURIComponent(tk) + '&path=' + encodeURIComponent('ivr2:' + d), {}, 6000, dl);
         const j = await r.json().catch(() => ({}));
         if (j.responseStatus !== 'OK') throw new Error('dir ' + JSON.stringify(j).slice(0, 100));
         if (!JSON.stringify(j).includes('beep.wav')) await upload('beep', makeBeep(), dl, d);
@@ -1358,7 +1405,8 @@ function flushSave(s) {
 }
 
 async function histList(ph, deadline) {
-  const r = await http(YM + 'GetIVR2Dir?token=' + encodeURIComponent(TOKEN) + '&path=' + encodeURIComponent('ivr2:' + HD), {}, 10000, deadline);
+  const tk = await getYemotToken(deadline);
+  const r = await http(YM + 'GetIVR2Dir?token=' + encodeURIComponent(tk) + '&path=' + encodeURIComponent('ivr2:' + HD), {}, 10000, deadline);
   const j = await r.json().catch(() => ({}));
   if (j.responseStatus !== 'OK') throw new Error('history list failed ' + JSON.stringify(j).slice(0, 120));
   const txt = JSON.stringify(j);
@@ -1494,7 +1542,8 @@ const enc = encodeURIComponent;
 let songCache = { t: 0, tracks: new Map() };
 
 async function songList(deadline) {
-  const r = await http(YM + 'GetIVR2Dir?token=' + enc(TOKEN) + '&path=' + enc('ivr2:' + SD), {}, 10000, deadline);
+  const tk = await getYemotToken(deadline);
+  const r = await http(YM + 'GetIVR2Dir?token=' + enc(tk) + '&path=' + enc('ivr2:' + SD), {}, 10000, deadline);
   const j = await r.json().catch(() => ({}));
   if (j.responseStatus !== 'OK') throw new Error('songs list failed ' + JSON.stringify(j).slice(0, 120));
   const txt = JSON.stringify(j);
@@ -1564,7 +1613,8 @@ async function scanRaw() {
     for (const name of l.raw) {
       if ((rawFail[name] || 0) > Date.now()) continue;
       try {
-        const r = await http(YM + 'DownloadFile?token=' + enc(TOKEN) + '&path=' + enc(yp(name, SD)), {}, 60000, Date.now() + 90000);
+        const tk = await getYemotToken(Date.now() + 15000);
+        const r = await http(YM + 'DownloadFile?token=' + enc(tk) + '&path=' + enc(yp(name, SD)), {}, 60000, Date.now() + 90000);
         const b = Buffer.from(await r.arrayBuffer());
         if (!r.ok || b.length < 1000 || b[0] === 0x7b) throw new Error('download failed ' + r.status + ' ' + b.length + ' ' + b.subarray(0, 60).toString('utf8').replace(/\s+/g, ' '));
         const mo = /^p(\d{7,15})[_\-]/.exec(name);
@@ -1609,7 +1659,8 @@ async function cleanOldMedia() {
   const cutoff = Date.now() - MEDIA_RETENTION_MS;
   for (const d of dirs) {
     try {
-      const r = await http(YM + 'GetIVR2Dir?token=' + enc(TOKEN) + '&path=' + enc('ivr2:' + d), {}, 10000, Date.now() + 15000);
+      const tk = await getYemotToken(Date.now() + 15000);
+      const r = await http(YM + 'GetIVR2Dir?token=' + enc(tk) + '&path=' + enc('ivr2:' + d), {}, 10000, Date.now() + 15000);
       const j = await r.json().catch(() => ({}));
       if (j.responseStatus !== 'OK') continue;
       const files = Array.isArray(j.files) ? j.files : [];
@@ -1774,7 +1825,8 @@ async function greetFile(d, deadline) {
   if (process.env.IGNORE_GREET_FILE === '1') return false;
   if (greetOk[d] !== undefined) return greetOk[d];
   try {
-    const r = await http(YM + 'GetIVR2Dir?token=' + encodeURIComponent(TOKEN) + '&path=' + encodeURIComponent('ivr2:' + d), {}, 3500, deadline);
+    const tk = await getYemotToken(deadline);
+    const r = await http(YM + 'GetIVR2Dir?token=' + encodeURIComponent(tk) + '&path=' + encodeURIComponent('ivr2:' + d), {}, 3500, deadline);
     const j = await r.json().catch(() => ({}));
     if (j.responseStatus !== 'OK') return false;
     greetOk[d] = JSON.stringify(j).includes('greet.wav');
@@ -1831,14 +1883,20 @@ app.get('/selftest', async (req, res) => {
     if (r.error) throw new Error(r.error);
     return ' (' + String(r.answer || '').length + ' תווים)';
   });
-  await step('טוקן ימות', async () => { if (!TOKEN || /undefined/.test(TOKEN)) throw new Error('YEMOT_TOKEN ריק'); });
+  await step('טוקן ימות', async () => {
+    if (!TOKEN || /undefined/.test(TOKEN)) throw new Error('YEMOT_TOKEN ריק');
+    const tk = await getYemotToken(deadline);
+    if (!tk) throw new Error('לא התקבל אסימון התחברות');
+  });
   await step('ימות: קריאת השלוחה ' + EXT, async () => {
-    const r = await http(YM + 'GetIVR2Dir?token=' + encodeURIComponent(TOKEN) + '&path=' + encodeURIComponent('ivr2:' + EXTP), {}, 10000, deadline);
+    const tk = await getYemotToken(deadline);
+    const r = await http(YM + 'GetIVR2Dir?token=' + encodeURIComponent(tk) + '&path=' + encodeURIComponent('ivr2:' + EXTP), {}, 10000, deadline);
     const j = await r.json().catch(() => ({}));
     if (j.responseStatus !== 'OK') throw new Error(JSON.stringify(j).slice(0, 180));
   });
   if (HD) await step('ימות: קריאת שלוחת ההיסטוריה ' + HD, async () => {
-    const r = await http(YM + 'GetIVR2Dir?token=' + encodeURIComponent(TOKEN) + '&path=' + encodeURIComponent('ivr2:' + HD), {}, 10000, deadline);
+    const tk = await getYemotToken(deadline);
+    const r = await http(YM + 'GetIVR2Dir?token=' + encodeURIComponent(tk) + '&path=' + encodeURIComponent('ivr2:' + HD), {}, 10000, deadline);
     const j = await r.json().catch(() => ({}));
     if (j.responseStatus !== 'OK') throw new Error(JSON.stringify(j).slice(0, 180));
   });
@@ -1865,7 +1923,8 @@ app.get('/selftest', async (req, res) => {
   });
   await step('ימות: העלאה ומחיקה של קובץ', async () => {
     await upload('selftest', silent, deadline);
-    const r = await http(YM + 'FileAction?token=' + encodeURIComponent(TOKEN) + '&action=delete&what=' + encodeURIComponent(yp('selftest')), {}, 8000, deadline);
+    const tk = await getYemotToken(deadline);
+    const r = await http(YM + 'FileAction?token=' + encodeURIComponent(tk) + '&action=delete&what=' + encodeURIComponent(yp('selftest')), {}, 8000, deadline);
     const j = await r.json().catch(() => ({}));
     if (j.responseStatus !== 'OK') throw new Error('מחיקה: ' + JSON.stringify(j).slice(0, 150));
   });
